@@ -7,7 +7,7 @@ from PIL import Image
 
 class DepthAnythingV2:
     """
-    Depth Anything V2 model wrapper for real-time depth estimation
+    Depth Anything V2 model wrapper for real-time depth estimation - OPTIMIZED
     """
     
     def __init__(self, model_size: str = "small", device: str = "auto"):
@@ -58,58 +58,70 @@ class DepthAnythingV2:
             self.use_transformers = False
             print(f"Loaded Depth Anything V2 ({self.model_size}) using torch hub")
             
+        # OPTIMIZATION: Warm up model for better first frame performance
+        print("Warming up model...")
+        self._warmup_model()
+        print(f"Model ready on {self.device}")
+    
+    def _warmup_model(self):
+        """Warm up the model with dummy data"""
+        dummy_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        _ = self.predict_depth(dummy_frame)
+        if hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
+            
     def preprocess_frame(self, frame: np.ndarray) -> torch.Tensor:
-        """Preprocess frame for model input"""
-        # Resize to standard input size (256x256 for better performance)
+        """OPTIMIZED: Preprocess frame for model input - faster version"""
         height, width = frame.shape[:2]
-        target_size = 512
         
-        # Maintain aspect ratio
-        scale = target_size / max(height, width)
-        new_height, new_width = int(height * scale), int(width * scale)
+        # OPTIMIZATION: Use smaller target size for much better performance
+        target_size = 256 if self.model_size == "small" else 384
         
-        frame_resized = cv2.resize(frame, (new_width, new_height))
+        # OPTIMIZATION: Direct resize without aspect ratio preservation for speed
+        frame_resized = cv2.resize(frame, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
         
-        # Pad to square
-        pad_height = target_size - new_height
-        pad_width = target_size - new_width
-        frame_padded = cv2.copyMakeBorder(
-            frame_resized, 0, pad_height, 0, pad_width, cv2.BORDER_CONSTANT, value=0
-        )
-        
-        # Convert to tensor
-        frame_rgb = cv2.cvtColor(frame_padded, cv2.COLOR_BGR2RGB)
-        frame_tensor = torch.from_numpy(frame_rgb).float() / 255.0
+        # OPTIMIZATION: Faster tensor conversion
+        frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+        frame_tensor = torch.from_numpy(frame_rgb).float().div_(255.0)  # In-place division
         frame_tensor = frame_tensor.permute(2, 0, 1).unsqueeze(0)
         
         if not self.use_transformers:
             frame_tensor = self.transform(frame_tensor)
             
-        return frame_tensor.to(self.device), (new_height, new_width), (height, width)
+        # OPTIMIZATION: Non-blocking transfer to GPU
+        return frame_tensor.to(self.device, non_blocking=True), (height, width)
     
     def predict_depth(self, frame: np.ndarray) -> np.ndarray:
-        """Predict depth map from frame"""
+        """OPTIMIZED: Predict depth map from frame"""
         if self.use_transformers:
-            # Using transformers pipeline
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # OPTIMIZATION: Resize input for faster transformers processing
+            h, w = frame.shape[:2]
+            target_size = 256 if self.model_size == "small" else 384
+            frame_small = cv2.resize(frame, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+            
+            frame_rgb = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(frame_rgb)
             result = self.pipe(pil_image)
             depth = np.array(result["depth"])
+            
+            # OPTIMIZATION: Fast resize back to original size
+            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
             return depth
         else:
-            # Using torch hub model
-            frame_tensor, processed_size, original_size = self.preprocess_frame(frame)
+            # Using torch hub model - optimized
+            frame_tensor, original_size = self.preprocess_frame(frame)
             
             with torch.no_grad():
                 depth = self.model(frame_tensor)
                 
-            depth = F.interpolate(depth.unsqueeze(1), processed_size, mode="bilinear", align_corners=False)
+            # OPTIMIZATION: Direct interpolation to original size
+            depth = F.interpolate(
+                depth.unsqueeze(1), 
+                size=original_size, 
+                mode="bilinear", 
+                align_corners=False
+            )
             depth = depth.squeeze().cpu().numpy()
-            
-            # Remove padding and resize back to original
-            new_height, new_width = processed_size
-            depth = depth[:new_height, :new_width]
-            depth = cv2.resize(depth, (original_size[1], original_size[0]))
             
             return depth
 
@@ -128,7 +140,7 @@ if __name__ == "__main__":
     depth_colored = cv2.resize(depth_colored, (frame.shape[1], frame.shape[0]))
     
     combined = np.hstack((frame, depth_colored))
-    cv2.imwrite("depth_output.jpg", combined)
+    cv2.imwrite("examples/depth_output.jpg", combined)
     cv2.imshow("Depth Anything V2", combined)
     cv2.waitKey(0)
     cv2.destroyAllWindows()

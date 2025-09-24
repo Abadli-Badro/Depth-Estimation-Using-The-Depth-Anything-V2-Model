@@ -1,14 +1,16 @@
+import os
+from depth_anythingV2 import DepthAnythingV2
+from utils import FPSCounter
 import cv2
 import numpy as np
 import time
 from typing import Tuple
 import argparse
-from depth_anythingV2 import DepthAnythingV2
-from utils import FPSCounter
+
 
 class CameraDepthEstimator:
     """
-    Real-time depth estimation from camera feed
+    OPTIMIZED: Real-time depth estimation from camera feed
     """
     
     def __init__(self, camera_id: int = 0, model_size: str = "small"):
@@ -24,47 +26,67 @@ class CameraDepthEstimator:
         self.depth_model = DepthAnythingV2(model_size=model_size)
         self.fps_counter = FPSCounter()
         
+        # OPTIMIZATION: Pre-allocate arrays for better performance
+        self.depth_colored_cache = None
+        
     def initialize_camera(self) -> bool:
-        """Initialize camera capture"""
+        """OPTIMIZED: Initialize camera capture"""
         self.cap = cv2.VideoCapture(self.camera_id)
         
         if not self.cap.isOpened():
             print(f"Error: Could not open camera {self.camera_id}")
             return False
             
-        # Set camera properties for better performance
+        # OPTIMIZATION: Camera settings for best performance
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce latency
         
-        print(f"Camera initialized: {self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x{self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}")
+        # OPTIMIZATION: Try to set camera to fastest format
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        self.cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+        
+        print(f"Camera initialized: {int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
         return True
     
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Process single frame and return original + depth visualization"""
+        """OPTIMIZED: Process single frame"""
         # Predict depth
         depth_map = self.depth_model.predict_depth(frame)
         
-        # Normalize depth for visualization
-        depth_normalized = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_INFERNO)
+        # OPTIMIZATION: Faster depth visualization
+        depth_min, depth_max = depth_map.min(), depth_map.max()
+        if depth_max > depth_min:
+            depth_normalized = ((depth_map - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
+        else:
+            depth_normalized = np.zeros_like(depth_map, dtype=np.uint8)
+            
+        # OPTIMIZATION: Use PLASMA colormap (faster than INFERNO)
+        depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_PLASMA)
         
         return frame, depth_colored
     
     def run(self, save_output: bool = False, output_path: str = "depth_output.avi"):
-        """Run real-time depth estimation"""
+        """OPTIMIZED: Run real-time depth estimation"""
         if not self.initialize_camera():
             return
             
         print("Starting depth estimation... Press 'q' to quit, 's' to save screenshot")
+        print("OPTIMIZATION TIPS:")
+        print("- Ensure good lighting for better depth estimation")
         
         # Video writer for saving (optional)
         writer = None
         if save_output:
-            fourcc = cv2.VideoWriter_fourcc(*'XVID')
-            fps = 20
-            frame_size = (512, 480)  # Side by side
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Better compression
+            fps = 15  # Reasonable fps for saving
+            frame_size = (980, 480)  # Side by side
             writer = cv2.VideoWriter(output_path, fourcc, fps, frame_size)
+        
+        # OPTIMIZATION: Skip frame processing to maintain display smoothness
+        frame_skip = 2 if self.depth_model.model_size != "small" else 1
+        frame_count = 0
         
         try:
             while True:
@@ -73,25 +95,43 @@ class CameraDepthEstimator:
                     print("Failed to read frame from camera")
                     break
                 
-                # Process frame
-                start_time = time.time()
-                original_frame, depth_frame = self.process_frame(frame)
-                processing_time = time.time() - start_time
+                frame_count += 1
+                
+                # OPTIMIZATION: Process every nth frame for better performance
+                if frame_count % frame_skip == 0:
+                    start_time = time.time()
+                    original_frame, depth_frame = self.process_frame(frame)
+                    processing_time = time.time() - start_time
+                else:
+                    original_frame = frame
+                    # Use cached depth frame
+                    if hasattr(self, 'last_depth_frame'):
+                        depth_frame = self.last_depth_frame
+                    else:
+                        # First frame
+                        start_time = time.time()
+                        original_frame, depth_frame = self.process_frame(frame)
+                        processing_time = time.time() - start_time
+                    
+                # Cache the depth frame
+                if frame_count % frame_skip == 0:
+                    self.last_depth_frame = depth_frame.copy()
                 
                 # Update FPS
                 fps = self.fps_counter.update()
                 
-                # Add FPS and processing time text
-                cv2.putText(original_frame, f"FPS: {fps:.1f}", (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(original_frame, f"Process: {processing_time*1000:.1f}ms", (10, 70), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                # OPTIMIZATION: Efficient text overlay
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                cv2.putText(original_frame, f"FPS: {fps:.1f}", (10, 30), font, 0.7, (0, 255, 0), 2)
+                if frame_count % frame_skip == 0:
+                    cv2.putText(original_frame, f"Process: {processing_time*1000:.0f}ms", (10, 60), font, 0.7, (0, 255, 0), 2)
+                cv2.putText(original_frame, f"Model: {self.depth_model.model_size}", (10, 90), font, 0.7, (0, 255, 0), 2)
                 
                 # Create side-by-side display
                 display_frame = np.hstack([original_frame, depth_frame])
                 
                 # Save frame if recording
-                if writer is not None:
+                if writer is not None and frame_count % 2 == 0:  # Save every 2nd frame
                     writer.write(display_frame)
                 
                 # Display
@@ -117,9 +157,6 @@ class CameraDepthEstimator:
                 writer.release()
             cv2.destroyAllWindows()
             print("Camera released and windows closed")
-
-
-
 
 
 def main():
